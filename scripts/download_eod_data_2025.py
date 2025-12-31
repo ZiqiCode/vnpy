@@ -77,11 +77,20 @@ class QMTDataDownloader:
                 logger.info(f"数据服务连接成功: {datafeed_name}")
                 # 初始化datafeed
                 if hasattr(self.datafeed, 'init'):
-                    self.datafeed.init()
+                    init_result = self.datafeed.init()
+                    if init_result:
+                        logger.info(f"数据服务初始化成功: {datafeed_name}")
+                    else:
+                        logger.warning(f"数据服务初始化返回False: {datafeed_name}")
+                else:
+                    logger.debug(f"数据服务没有init方法: {datafeed_name}")
             else:
                 logger.warning("未配置数据服务（datafeed.name），请检查全局配置")
+                logger.warning("将使用BaseDatafeed（可能无法获取数据）")
         except Exception as e:
             logger.error(f"数据服务初始化失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             logger.warning("请检查全局配置中的datafeed设置")
             self.datafeed = None
         
@@ -197,62 +206,252 @@ class QMTDataDownloader:
     def download_stock_data(self, stock_code: str, period: str, 
                            start_time: str = None, end_time: str = None) -> bool:
         """
-        下载单只股票的历史数据并保存到数据库
+        使用vnpy datafeed下载单只股票的历史数据并保存到数据库
         Args:
-            stock_code: 股票代码，格式如 "600000.SH"
+            stock_code: 股票代码，格式如 "600000.SH" 或 "600000.SSE"
             period: 周期，如 "1d", "1m", "5m", "60m"
             start_time: 开始时间，格式YYYYMMDD
             end_time: 结束时间，格式YYYYMMDD
         Returns:
             是否成功
         """
+        if not self.datafeed:
+            logger.error("数据服务未初始化，无法下载数据")
+            return False
+        
         try:
             if start_time is None:
                 start_time = self.start_date
             if end_time is None:
                 end_time = self.end_date
             
-            # 下载历史数据到QMT本地
-            xtdata.download_history_data(
-                stock_code,
-                period=period,
-                start_time=start_time,
-                end_time=end_time,
-                incrementally=True  # 增量下载
+            # 解析股票代码
+            symbol, exchange = self._parse_stock_code(stock_code)
+            if symbol is None or exchange is None:
+                logger.warning(f"无法解析股票代码: {stock_code}")
+                return False
+            
+            # 获取周期对应的Interval
+            interval = self.period_map.get(period, Interval.MINUTE)
+            
+            # 转换时间格式
+            start_dt = datetime.strptime(start_time, "%Y%m%d")
+            start_dt = start_dt.replace(tzinfo=DB_TZ)
+            
+            end_dt = datetime.strptime(end_time, "%Y%m%d")
+            end_dt = end_dt.replace(hour=23, minute=59, second=59, tzinfo=DB_TZ)
+            
+            # 对于5分钟数据，需要特殊处理
+            # 如果datafeed支持自定义分钟数，可以在HistoryRequest中指定
+            # 否则可能需要通过其他方式处理
+            if period == '5m':
+                # 某些datafeed可能需要特殊处理5分钟数据
+                # 这里先尝试使用MINUTE，如果datafeed支持，会自动处理
+                interval = Interval.MINUTE
+            
+            # 构建HistoryRequest
+            req = HistoryRequest(
+                symbol=symbol,
+                exchange=exchange,
+                start=start_dt,
+                end=end_dt,
+                interval=interval
             )
             
-            # 如果配置了保存到数据库，则从QMT读取数据并保存
+            # 如果使用xt数据源，可能需要先下载数据到本地
+            # 某些datafeed（如vnpy_xt）可能需要先调用download_history_data
+            if HAS_XTQUANT and SETTINGS.get("datafeed.name", "") == "xt":
+                try:
+                    # 转换stock_code格式为xt格式（如果需要）
+                    if stock_code.endswith('.SSE'):
+                        xt_code = stock_code.replace('.SSE', '.SH')
+                    elif stock_code.endswith('.SZSE'):
+                        xt_code = stock_code.replace('.SZSE', '.SZ')
+                    else:
+                        xt_code = stock_code
+                    
+                    logger.debug(f"预下载数据到本地: {xt_code} {period} ({start_time} - {end_time})")
+                    
+                    # xt需要先下载数据到本地
+                    logger.info(f"正在下载数据到xt本地: {xt_code} {period} ({start_time} - {end_time})")
+                    try:
+                        result = xtdata.download_history_data(
+                            xt_code,
+                            period=period,
+                            start_time=start_time,
+                            end_time=end_time,
+                            incrementally=True
+                        )
+                        logger.debug(f"download_history_data返回: {result}")
+                    except Exception as e:
+                        logger.warning(f"download_history_data异常: {e}")
+                    
+                    # 增加等待时间，确保数据下载完成
+                    logger.info("等待数据下载完成...")
+                    time.sleep(2.0)  # 增加等待时间到2秒
+                    logger.debug(f"预下载完成: {xt_code} {period}")
+                except Exception as e:
+                    logger.warning(f"预下载数据到本地失败 {stock_code} {period}: {e}")
+                    # 即使预下载失败，也尝试查询（可能数据已存在）
+            
+            # 通过datafeed查询数据
+            logger.info(f"查询数据: {symbol}.{exchange.value} {interval} ({start_dt} - {end_dt})")
+            logger.debug(f"HistoryRequest: symbol={symbol}, exchange={exchange}, start={start_dt}, end={end_dt}, interval={interval}")
+            
+            bars = []
+            
+            # 方法1：尝试通过datafeed查询
+            try:
+                bars = self.datafeed.query_bar_history(req)
+                logger.debug(f"datafeed.query_bar_history 返回: {len(bars) if bars else 0} 条数据")
+            except Exception as e:
+                logger.warning(f"通过datafeed查询数据失败: {e}")
+                logger.debug("将尝试直接从xt获取数据")
+            
+            # 方法2：如果datafeed返回空，且使用xt数据源，直接从xt获取数据
+            if not bars and HAS_XTQUANT and SETTINGS.get("datafeed.name", "") == "xt":
+                try:
+                    if stock_code.endswith('.SSE'):
+                        xt_code = stock_code.replace('.SSE', '.SH')
+                    elif stock_code.endswith('.SZSE'):
+                        xt_code = stock_code.replace('.SZSE', '.SZ')
+                    else:
+                        xt_code = stock_code
+                    
+                    logger.info(f"直接从xt获取数据: {xt_code} {period}")
+                    
+                    # 根据xt文档，get_market_data_ex应该使用count=-1获取所有本地数据
+                    # 然后手动过滤日期范围
+                    import pandas as pd  # 确保pd已导入
+                    
+                    try:
+                        # 方法1：使用count=-1获取所有本地数据（推荐方式）
+                        logger.info("使用count=-1获取所有本地数据...")
+                        xt_data = xtdata.get_market_data_ex(
+                            field_list=[],  # 空列表表示获取所有字段
+                            stock_list=[xt_code],
+                            period=period,
+                            count=-1  # -1表示获取所有本地数据
+                        )
+                        logger.debug(f"get_market_data_ex(count=-1)返回类型: {type(xt_data)}")
+                        
+                        # 如果返回的是字典，提取对应股票的数据
+                        if isinstance(xt_data, dict):
+                            if xt_code in xt_data:
+                                data = xt_data[xt_code]
+                                logger.debug(f"提取的数据类型: {type(data)}, 是否为空: {data.empty if isinstance(data, pd.DataFrame) else 'N/A'}")
+                                
+                                # 如果是DataFrame，需要按日期过滤
+                                if isinstance(data, pd.DataFrame) and not data.empty:
+                                    # 过滤日期范围
+                                    if 'time' in data.columns:
+                                        # time列可能是日期字符串或时间戳
+                                        try:
+                                            # 尝试转换为日期
+                                            data['date'] = pd.to_datetime(data['time'], errors='coerce')
+                                            # 过滤日期范围
+                                            start_dt_filter = datetime.strptime(start_time, "%Y%m%d")
+                                            end_dt_filter = datetime.strptime(end_time, "%Y%m%d")
+                                            mask = (data['date'] >= start_dt_filter) & (data['date'] <= end_dt_filter)
+                                            data = data[mask]
+                                            logger.info(f"过滤后数据量: {len(data)} 条")
+                                        except Exception as e:
+                                            logger.warning(f"日期过滤失败: {e}")
+                                    
+                                    # 更新xt_data字典
+                                    xt_data[xt_code] = data
+                                elif isinstance(data, pd.DataFrame) and data.empty:
+                                    logger.warning(f"xt本地数据为空: {xt_code} {period}")
+                            else:
+                                logger.warning(f"xt返回的字典中没有 {xt_code}")
+                                xt_data = None
+                    except Exception as e:
+                        logger.error(f"get_market_data_ex失败: {e}")
+                        import traceback
+                        logger.debug(traceback.format_exc())
+                        xt_data = None
+                    
+                    if xt_data and xt_code in xt_data:
+                        # 转换xt数据为BarData
+                        import pandas as pd
+                        data = xt_data[xt_code]
+                        
+                        logger.info(f"xt返回数据类型: {type(data)}")
+                        if isinstance(data, pd.DataFrame):
+                            logger.info(f"DataFrame形状: {data.shape}, 列: {data.columns.tolist()}")
+                            if not data.empty:
+                                logger.info(f"DataFrame前5行:\n{data.head()}")
+                                
+                                # DataFrame格式
+                                for idx, row in data.iterrows():
+                                    try:
+                                        # 转换时间
+                                        if isinstance(idx, pd.Timestamp):
+                                            dt = idx.to_pydatetime()
+                                        else:
+                                            dt = datetime.strptime(str(idx), "%Y%m%d") if len(str(idx)) == 8 else datetime.fromtimestamp(idx)
+                                        
+                                        if dt.tzinfo is None:
+                                            dt = dt.replace(tzinfo=DB_TZ)
+                                        dt = dt.astimezone(DB_TZ).replace(tzinfo=None)
+                                        
+                                        # 创建BarData
+                                        bar = BarData(
+                                            symbol=symbol,
+                                            exchange=exchange,
+                                            datetime=dt,
+                                            interval=interval,
+                                            open_price=float(row.get('open', 0)),
+                                            high_price=float(row.get('high', 0)),
+                                            low_price=float(row.get('low', 0)),
+                                            close_price=float(row.get('close', 0)),
+                                            volume=float(row.get('volume', 0)),
+                                            turnover=float(row.get('amount', 0)),
+                                            gateway_name="xt"
+                                        )
+                                        bars.append(bar)
+                                    except Exception as e:
+                                        logger.debug(f"转换数据行失败: {e}")
+                                        continue
+                                
+                                logger.info(f"从xt直接获取并转换了 {len(bars)} 条数据")
+                            else:
+                                logger.warning("DataFrame为空！")
+                        elif isinstance(data, dict):
+                            logger.info(f"返回的是字典格式，键: {list(data.keys())[:10]}")
+                            logger.info(f"字典示例: {str(data)[:200]}")
+                            logger.warning("字典格式暂不支持，需要手动转换")
+                        else:
+                            logger.warning(f"未知的数据格式: {type(data)}")
+                    else:
+                        logger.warning(f"xt本地也没有数据: {xt_code} {period}")
+                except Exception as e:
+                    logger.error(f"直接从xt获取数据失败: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+            
+            if not bars:
+                logger.warning(f"未获取到数据: {stock_code} {period} (symbol={symbol}, exchange={exchange.value}, interval={interval})")
+                logger.debug(f"请求详情: start={start_dt}, end={end_dt}, period={period}")
+                return False
+            
+            logger.debug(f"成功获取 {len(bars)} 条数据: {stock_code} {period}")
+            
+            # 保存到数据库
             if self.save_to_db and self.database:
                 try:
-                    # 等待一下，确保数据已下载完成
-                    time.sleep(0.1)
-                    
-                    # 从QMT获取数据
-                    # 注意：get_market_data_ex需要指定字段列表，空列表表示获取所有字段
-                    xt_data = xtdata.get_market_data_ex(
-                        stock_list=[stock_code],
-                        period=period,
-                        start_time=start_time,
-                        end_time=end_time
-                    )
-                    
-                    if xt_data and stock_code in xt_data:
-                        # 转换数据格式
-                        bars = self.convert_xt_to_bardata(
-                            stock_code, period, xt_data[stock_code]
-                        )
-                        
-                        # 保存到数据库
-                        if bars:
-                            self.database.save_bar_data(bars, stream=True)
-                            logger.debug(f"保存 {stock_code} {period} 数据到数据库: {len(bars)}条")
+                    self.database.save_bar_data(bars, stream=True)
+                    logger.debug(f"保存 {stock_code} {period} 数据到数据库: {len(bars)}条")
                 except Exception as e:
                     logger.warning(f"保存 {stock_code} {period} 到数据库失败: {e}")
-                    # 下载到QMT成功，但保存到数据库失败，仍然返回True
+                    return False
             
             return True
+            
         except Exception as e:
             logger.error(f"下载 {stock_code} {period} 数据失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return False
     
     def download_all_data(self, stock_list: List[str] = None, 
@@ -262,7 +461,7 @@ class QMTDataDownloader:
         下载所有数据
         Args:
             stock_list: 股票列表，如果为None则自动获取
-            periods: 需要下载的周期列表，如果为None则下载所有周期
+            periods: 需要下载的周期列表，如 ['1d', '1m', '5m', '60m']，如果为None则下载所有周期
             filter_invalid: 是否过滤无效股票代码（默认True）
         Returns:
             下载结果统计
@@ -271,7 +470,8 @@ class QMTDataDownloader:
             stock_list = self.get_stock_list()
         
         if periods is None:
-            periods = list(self.periods.values())
+            # 默认下载所有周期
+            periods = ['1d', '1m', '5m', '60m']
         
         if not stock_list:
             logger.error("股票列表为空，无法下载")
@@ -367,8 +567,15 @@ def main():
                        help="下载周期，默认: 1d 1m 5m 60m")
     parser.add_argument("--download_index", action='store_true',
                        help="是否下载指数数据")
+    parser.add_argument("--debug", action='store_true',
+                       help="启用调试模式（显示详细日志）")
     
     args = parser.parse_args()
+    
+    # 设置日志级别
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
     
     # 创建下载器
     downloader = QMTDataDownloader(
@@ -408,9 +615,10 @@ def main():
     logger.info(f"失败: {results['failed']} 项")
     logger.info("=" * 50)
     logger.info("数据存储说明:")
-    logger.info("1. QMT下载的数据会保存到QMT本地数据目录")
+    datafeed_name = SETTINGS.get("datafeed.name", "unknown")
+    logger.info(f"1. 数据服务: {datafeed_name}")
     if downloader.save_to_db:
-        logger.info("2. 数据已同步保存到数据库")
+        logger.info("2. 数据已保存到数据库")
         logger.info(f"   - 数据库类型: {SETTINGS.get('database.name', 'unknown')}")
         logger.info(f"   - 服务器地址: {SETTINGS.get('database.host', 'unknown')}:{SETTINGS.get('database.port', 'unknown')}")
         logger.info(f"   - 数据库实例: {SETTINGS.get('database.database', 'unknown')}")
