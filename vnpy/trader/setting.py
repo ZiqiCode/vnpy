@@ -24,8 +24,8 @@ SETTINGS: dict = {
     "email.sender": "",
     "email.receiver": "",
 
-    "datafeed.name": "",
-    "datafeed.username": "",
+    "datafeed.name": "xt",
+    "datafeed.username": "client",
     "datafeed.password": "",
 
     "database.timezone": get_localzone_name(),
