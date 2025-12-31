@@ -29,10 +29,10 @@ SETTINGS: dict = {
     "datafeed.password": "",
 
     "database.timezone": get_localzone_name(),
-    "database.name": "sqlite",
-    "database.database": "database.db",
-    "database.host": "",
-    "database.port": 0,
+    "database.name": "mongodb",
+    "database.database": "vnpy",
+    "database.host": "localhost",
+    "database.port": 27017,
     "database.user": "",
     "database.password": ""
 }

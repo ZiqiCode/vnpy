@@ -151,8 +151,15 @@ def get_database() -> BaseDatabase:
     try:
         module: ModuleType = import_module(module_name)
     except ModuleNotFoundError:
-        print(_("找不到数据库驱动{}，使用默认的SQLite数据库").format(module_name))
-        module = import_module("vnpy_sqlite")
+        # 默认使用MongoDB，如果MongoDB不可用则提示错误
+        if database_name != "mongodb":
+            print(_("找不到数据库驱动{}，尝试使用MongoDB").format(module_name))
+        try:
+            module = import_module("vnpy_mongodb")
+            print(_("已切换到MongoDB数据库"))
+        except ModuleNotFoundError:
+            print(_("错误：找不到MongoDB驱动，请安装 vnpy_mongodb: pip install vnpy_mongodb"))
+            raise
 
     # Create database object from module
     database = module.Database()
