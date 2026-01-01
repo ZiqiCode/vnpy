@@ -12,12 +12,7 @@ from math import floor, ceil
 from typing import overload, Literal
 
 import numpy as np
-try:
-    import talib
-except ImportError:
-    talib = None
-    import warnings
-    warnings.warn("TA-Lib not installed. Some technical analysis functions may not work.")
+import talib
 from zoneinfo import ZoneInfo, available_timezones      # noqa
 
 from .object import BarData, TickData

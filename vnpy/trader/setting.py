@@ -24,15 +24,15 @@ SETTINGS: dict = {
     "email.sender": "",
     "email.receiver": "",
 
-    "datafeed.name": "xt",
-    "datafeed.username": "client",
+    "datafeed.name": "",
+    "datafeed.username": "",
     "datafeed.password": "",
 
     "database.timezone": get_localzone_name(),
-    "database.name": "mongodb",
-    "database.database": "vnpy",
-    "database.host": "localhost",
-    "database.port": 27017,
+    "database.name": "sqlite",
+    "database.database": "database.db",
+    "database.host": "",
+    "database.port": 0,
     "database.user": "",
     "database.password": ""
 }

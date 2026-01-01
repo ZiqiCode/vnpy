@@ -11,61 +11,19 @@ import polars as pl
 from vnpy.trader.object import BarData
 from vnpy.trader.constant import Interval
 from vnpy.trader.utility import extract_vt_symbol
-from vnpy.trader.database import get_database, DB_TZ
 
 from .logger import logger
 from .dataset import AlphaDataset, to_datetime
 from .model import AlphaModel
 
-# 尝试导入MongoDB存储
-try:
-    from vnpy.trader.mongodb_storage import MongoDBStorage
-    MONGODB_STORAGE_AVAILABLE = True
-except ImportError:
-    MONGODB_STORAGE_AVAILABLE = False
-    MongoDBStorage = None
-
 
 class AlphaLab:
     """Alpha Research Laboratory"""
 
-    def __init__(self, lab_path: str = None, use_mongodb: bool = True) -> None:
-        """
-        Constructor
-        Args:
-            lab_path: 实验室路径（用于存储非K线数据，如dataset、model等）
-            use_mongodb: 是否使用MongoDB存储K线数据（默认True）
-        """
-        # 初始化数据库（用于K线数据）
-        self.use_mongodb = use_mongodb
-        if self.use_mongodb:
-            try:
-                self.database = get_database()
-                logger.info("AlphaLab: 使用MongoDB存储K线数据")
-            except Exception as e:
-                logger.warning(f"AlphaLab: MongoDB连接失败，将使用文件存储: {e}")
-                self.use_mongodb = False
-                self.database = None
-        else:
-            self.database = None
-        
-        # 初始化MongoDB存储（用于其他数据）
-        self.mongodb_storage = None
-        if MONGODB_STORAGE_AVAILABLE and self.use_mongodb:
-            try:
-                self.mongodb_storage = MongoDBStorage()
-                logger.info("AlphaLab: 使用MongoDB存储其他数据（成分股、数据集、模型等）")
-            except Exception as e:
-                logger.warning(f"AlphaLab: MongoDB存储初始化失败: {e}")
-                self.mongodb_storage = None
-        
-        # Set data paths（用于存储非K线数据，如dataset、model等）
-        if lab_path:
-            self.lab_path: Path = Path(lab_path)
-        else:
-            # 使用当前工作目录下的默认路径
-            cwd: Path = Path.cwd()
-            self.lab_path: Path = cwd.joinpath(".vntrader", "alpha_lab")
+    def __init__(self, lab_path: str) -> None:
+        """Constructor"""
+        # Set data paths
+        self.lab_path: Path = Path(lab_path)
 
         self.daily_path: Path = self.lab_path.joinpath("daily")
         self.minute_path: Path = self.lab_path.joinpath("minute")
@@ -77,9 +35,11 @@ class AlphaLab:
 
         self.contract_path: Path = self.lab_path.joinpath("contract.json")
 
-        # Create folders（仅用于非K线数据）
+        # Create folders
         for path in [
             self.lab_path,
+            self.daily_path,
+            self.minute_path,
             self.component_path,
             self.dataset_path,
             self.model_path,
@@ -89,21 +49,11 @@ class AlphaLab:
                 path.mkdir(parents=True)
 
     def save_bar_data(self, bars: list[BarData]) -> None:
-        """Save bar data to MongoDB"""
+        """Save bar data"""
         if not bars:
             return
 
-        # 优先使用MongoDB
-        if self.use_mongodb and self.database:
-            try:
-                self.database.save_bar_data(bars, stream=True)
-                logger.debug(f"保存 {len(bars)} 条K线数据到MongoDB")
-                return
-            except Exception as e:
-                logger.warning(f"MongoDB保存失败，回退到文件存储: {e}")
-                self.use_mongodb = False
-        
-        # 回退到文件存储（兼容旧代码）
+        # Get file path
         bar: BarData = bars[0]
 
         if bar.interval == Interval.DAILY:
@@ -113,9 +63,6 @@ class AlphaLab:
         elif bar.interval:
             logger.error(f"Unsupported interval {bar.interval.value}")
             return
-
-        # 确保目录存在
-        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         data: list = []
         for bar in bars:
@@ -153,7 +100,7 @@ class AlphaLab:
         start: datetime | str,
         end: datetime | str
     ) -> list[BarData]:
-        """Load bar data from MongoDB or file"""
+        """Load bar data"""
         # Convert types
         if isinstance(interval, str):
             interval = Interval(interval)
@@ -161,24 +108,6 @@ class AlphaLab:
         start = to_datetime(start)
         end = to_datetime(end)
 
-        # 优先从MongoDB加载
-        if self.use_mongodb and self.database:
-            try:
-                symbol, exchange = extract_vt_symbol(vt_symbol)
-                bars = self.database.load_bar_data(
-                    symbol=symbol,
-                    exchange=exchange,
-                    interval=interval,
-                    start=start.replace(tzinfo=DB_TZ),
-                    end=end.replace(tzinfo=DB_TZ)
-                )
-                if bars:
-                    logger.debug(f"从MongoDB加载 {len(bars)} 条K线数据")
-                    return bars
-            except Exception as e:
-                logger.warning(f"从MongoDB加载失败，尝试从文件加载: {e}")
-
-        # 回退到文件存储（兼容旧代码）
         # Get folder path
         if interval == Interval.DAILY:
             folder_path: Path = self.daily_path
@@ -191,7 +120,7 @@ class AlphaLab:
         # Check if file exists
         file_path: Path = folder_path.joinpath(f"{vt_symbol}.parquet")
         if not file_path.exists():
-            logger.warning(f"File {file_path} does not exist")
+            logger.error(f"File {file_path} does not exist")
             return []
 
         # Open file
@@ -232,7 +161,7 @@ class AlphaLab:
         end: datetime | str,
         extended_days: int
     ) -> pl.DataFrame | None:
-        """Load bar data as DataFrame from MongoDB or file"""
+        """Load bar data as DataFrame"""
         if not vt_symbols:
             return None
 
@@ -243,46 +172,6 @@ class AlphaLab:
         start = to_datetime(start) - timedelta(days=extended_days)
         end = to_datetime(end) + timedelta(days=extended_days // 10)
 
-        # 优先从MongoDB加载
-        if self.use_mongodb and self.database:
-            try:
-                all_bars = []
-                for vt_symbol in vt_symbols:
-                    symbol, exchange = extract_vt_symbol(vt_symbol)
-                    bars = self.database.load_bar_data(
-                        symbol=symbol,
-                        exchange=exchange,
-                        interval=interval,
-                        start=start.replace(tzinfo=DB_TZ),
-                        end=end.replace(tzinfo=DB_TZ)
-                    )
-                    if bars:
-                        all_bars.extend(bars)
-                
-                if all_bars:
-                    # 转换为DataFrame
-                    data = []
-                    for bar in all_bars:
-                        bar_data = {
-                            "datetime": bar.datetime.replace(tzinfo=None),
-                            "open": bar.open_price,
-                            "high": bar.high_price,
-                            "low": bar.low_price,
-                            "close": bar.close_price,
-                            "volume": bar.volume,
-                            "turnover": bar.turnover,
-                            "open_interest": bar.open_interest,
-                            "vt_symbol": bar.vt_symbol
-                        }
-                        data.append(bar_data)
-                    
-                    df = pl.DataFrame(data)
-                    # 继续后续处理
-                    return self._process_bar_df(df)
-            except Exception as e:
-                logger.warning(f"从MongoDB加载DataFrame失败，尝试从文件加载: {e}")
-
-        # 回退到文件存储
         # Get folder path
         if interval == Interval.DAILY:
             folder_path: Path = self.daily_path
@@ -299,7 +188,7 @@ class AlphaLab:
             # Check if file exists
             file_path: Path = folder_path.joinpath(f"{vt_symbol}.parquet")
             if not file_path.exists():
-                logger.warning(f"File {file_path} does not exist")
+                logger.error(f"File {file_path} does not exist")
                 continue
 
             # Open file
@@ -308,40 +197,25 @@ class AlphaLab:
             # Filter by date range
             df = df.filter((pl.col("datetime") >= start) & (pl.col("datetime") <= end))
 
+            # Specify data types
+            df = df.with_columns(
+                pl.col("open"),
+                pl.col("high"),
+                pl.col("low"),
+                pl.col("close"),
+                pl.col("volume"),
+                pl.col("turnover"),
+                pl.col("open_interest"),
+                (pl.col("turnover") / pl.col("volume")).alias("vwap")
+            )
+
             # Check for empty data
             if df.is_empty():
                 continue
 
-            # Add symbol column if not exists
-            if "vt_symbol" not in df.columns:
-                df = df.with_columns(pl.lit(vt_symbol).alias("vt_symbol"))
+            # Normalize prices
+            close_0: float = df.select(pl.col("close")).item(0, 0)
 
-            # Process DataFrame
-            df = self._process_bar_df(df)
-
-            # Cache in list
-            dfs.append(df)
-
-        if not dfs:
-            return None
-
-        # Concatenate results
-        result_df: pl.DataFrame = pl.concat(dfs)
-        return result_df
-    
-    def _process_bar_df(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Process bar DataFrame (normalize prices, add vwap, etc.)"""
-        if df.is_empty():
-            return df
-        
-        # Specify data types and add vwap
-        df = df.with_columns(
-            (pl.col("turnover") / pl.col("volume")).alias("vwap")
-        )
-
-        # Normalize prices by first close price
-        close_0: float = df.select(pl.col("close")).item(0, 0)
-        if close_0 > 0:
             df = df.with_columns(
                 (pl.col("open") / close_0).alias("open"),
                 (pl.col("high") / close_0).alias("high"),
@@ -349,56 +223,35 @@ class AlphaLab:
                 (pl.col("close") / close_0).alias("close"),
             )
 
-        # Convert zeros to NaN for suspended trading days
-        numeric_columns: list = [col for col in df.columns 
-                                 if col not in ["datetime", "vt_symbol"]]
-        
-        if numeric_columns:
-            mask: pl.Series = df[numeric_columns].sum_horizontal() == 0
-            
-            df = df.with_columns(
-                [pl.when(mask).then(float("nan")).otherwise(pl.col(col)).alias(col) 
-                 for col in numeric_columns]
+            # Convert zeros to NaN for suspended trading days
+            numeric_columns: list = df.columns[1:]                              # Extract numeric columns
+
+            mask: pl.Series = df[numeric_columns].sum_horizontal() == 0         # Sum by row, if 0 then suspended
+
+            df = df.with_columns(                                               # Convert suspended day values to NaN
+                [pl.when(mask).then(float("nan")).otherwise(pl.col(col)).alias(col) for col in numeric_columns]
             )
 
-        return df
+            # Add symbol column
+            df = df.with_columns(pl.lit(vt_symbol).alias("vt_symbol"))
+
+            # Cache in list
+            dfs.append(df)
+
+        # Concatenate results
+        result_df: pl.DataFrame = pl.concat(dfs)
+        return result_df
 
     def save_component_data(
         self,
         index_symbol: str,
         index_components: dict[str, list[str]]
     ) -> None:
-        """Save index component data to MongoDB or file"""
-        # 优先使用MongoDB
-        if self.mongodb_storage:
-            try:
-                # 转换格式：datetime -> str
-                components_dict = {}
-                for dt, symbols in index_components.items():
-                    if isinstance(dt, datetime):
-                        date_str = dt.strftime("%Y-%m-%d")
-                    else:
-                        date_str = str(dt)
-                    components_dict[date_str] = symbols
-                
-                if self.mongodb_storage.save_component_data(index_symbol, components_dict):
-                    logger.debug(f"成分股数据已保存到MongoDB: {index_symbol}")
-                    return
-            except Exception as e:
-                logger.warning(f"MongoDB保存成分股数据失败，回退到文件存储: {e}")
-        
-        # 回退到文件存储
+        """Save index component data"""
         file_path: Path = self.component_path.joinpath(f"{index_symbol}")
-        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         with shelve.open(str(file_path)) as db:
-            # 转换datetime为字符串key
-            for dt, symbols in index_components.items():
-                if isinstance(dt, datetime):
-                    key = dt.strftime("%Y-%m-%d")
-                else:
-                    key = str(dt)
-                db[key] = symbols
+            db.update(index_components)
 
     @lru_cache      # noqa
     def load_component_data(
@@ -407,25 +260,11 @@ class AlphaLab:
         start: datetime | str,
         end: datetime | str
     ) -> dict[datetime, list[str]]:
-        """Load index component data from MongoDB or file"""
+        """Load index component data as DataFrame"""
+        file_path: Path = self.component_path.joinpath(f"{index_symbol}")
+
         start = to_datetime(start)
         end = to_datetime(end)
-        
-        # 优先从MongoDB加载
-        if self.mongodb_storage:
-            try:
-                components = self.mongodb_storage.load_component_data(index_symbol, start, end)
-                if components:
-                    logger.debug(f"从MongoDB加载成分股数据: {index_symbol}")
-                    return components
-            except Exception as e:
-                logger.warning(f"从MongoDB加载成分股数据失败，尝试从文件加载: {e}")
-        
-        # 回退到文件存储
-        file_path: Path = self.component_path.joinpath(f"{index_symbol}")
-        
-        if not file_path.exists():
-            return {}
 
         with shelve.open(str(file_path)) as db:
             keys: list[str] = list(db.keys())
@@ -548,39 +387,17 @@ class AlphaLab:
         return contracts
 
     def save_dataset(self, name: str, dataset: AlphaDataset) -> None:
-        """Save dataset to MongoDB or file"""
-        # 优先使用MongoDB
-        if self.mongodb_storage:
-            try:
-                if self.mongodb_storage.save_dataset(name, dataset):
-                    logger.debug(f"数据集已保存到MongoDB: {name}")
-                    return
-            except Exception as e:
-                logger.warning(f"MongoDB保存数据集失败，回退到文件存储: {e}")
-        
-        # 回退到文件存储
+        """Save dataset"""
         file_path: Path = self.dataset_path.joinpath(f"{name}.pkl")
-        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(file_path, mode="wb") as f:
             pickle.dump(dataset, f)
 
     def load_dataset(self, name: str) -> AlphaDataset | None:
-        """Load dataset from MongoDB or file"""
-        # 优先从MongoDB加载
-        if self.mongodb_storage:
-            try:
-                dataset = self.mongodb_storage.load_dataset(name)
-                if dataset:
-                    logger.debug(f"从MongoDB加载数据集: {name}")
-                    return dataset
-            except Exception as e:
-                logger.warning(f"从MongoDB加载数据集失败，尝试从文件加载: {e}")
-        
-        # 回退到文件存储
+        """Load dataset"""
         file_path: Path = self.dataset_path.joinpath(f"{name}.pkl")
         if not file_path.exists():
-            logger.warning(f"Dataset file {name} does not exist")
+            logger.error(f"Dataset file {name} does not exist")
             return None
 
         with open(file_path, mode="rb") as f:
@@ -598,57 +415,21 @@ class AlphaLab:
         return True
 
     def list_all_datasets(self) -> list[str]:
-        """List all datasets from MongoDB and files"""
-        datasets = set()
-        
-        # 从MongoDB获取
-        if self.mongodb_storage:
-            try:
-                mongodb_datasets = self.mongodb_storage.list_datasets()
-                datasets.update(mongodb_datasets)
-            except Exception as e:
-                logger.warning(f"从MongoDB列出数据集失败: {e}")
-        
-        # 从文件获取
-        file_datasets = [file.stem for file in self.dataset_path.glob("*.pkl")]
-        datasets.update(file_datasets)
-        
-        return sorted(list(datasets))
+        """List all datasets"""
+        return [file.stem for file in self.dataset_path.glob("*.pkl")]
 
     def save_model(self, name: str, model: AlphaModel) -> None:
-        """Save model to MongoDB or file"""
-        # 优先使用MongoDB
-        if self.mongodb_storage:
-            try:
-                if self.mongodb_storage.save_model(name, model):
-                    logger.debug(f"模型已保存到MongoDB: {name}")
-                    return
-            except Exception as e:
-                logger.warning(f"MongoDB保存模型失败，回退到文件存储: {e}")
-        
-        # 回退到文件存储
+        """Save model"""
         file_path: Path = self.model_path.joinpath(f"{name}.pkl")
-        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(file_path, mode="wb") as f:
             pickle.dump(model, f)
 
     def load_model(self, name: str) -> AlphaModel | None:
-        """Load model from MongoDB or file"""
-        # 优先从MongoDB加载
-        if self.mongodb_storage:
-            try:
-                model = self.mongodb_storage.load_model(name)
-                if model:
-                    logger.debug(f"从MongoDB加载模型: {name}")
-                    return model
-            except Exception as e:
-                logger.warning(f"从MongoDB加载模型失败，尝试从文件加载: {e}")
-        
-        # 回退到文件存储
+        """Load model"""
         file_path: Path = self.model_path.joinpath(f"{name}.pkl")
         if not file_path.exists():
-            logger.warning(f"Model file {name} does not exist")
+            logger.error(f"Model file {name} does not exist")
             return None
 
         with open(file_path, mode="rb") as f:
@@ -666,22 +447,8 @@ class AlphaLab:
         return True
 
     def list_all_models(self) -> list[str]:
-        """List all models from MongoDB and files"""
-        models = set()
-        
-        # 从MongoDB获取
-        if self.mongodb_storage:
-            try:
-                mongodb_models = self.mongodb_storage.list_models()
-                models.update(mongodb_models)
-            except Exception as e:
-                logger.warning(f"从MongoDB列出模型失败: {e}")
-        
-        # 从文件获取
-        file_models = [file.stem for file in self.model_path.glob("*.pkl")]
-        models.update(file_models)
-        
-        return sorted(list(models))
+        """List all models"""
+        return [file.stem for file in self.model_path.glob("*.pkl")]
 
     def save_signal(self, name: str, signal: pl.DataFrame) -> None:
         """Save signal"""
